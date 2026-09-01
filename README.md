@@ -2,6 +2,8 @@
 
 Code for **Towards Structured Context Modeling for Conversational Recommender Systems via Dual Monte Carlo Tree Search**.
 
+🎉 Our paper has been accepted to the **EMNLP 2026 Main Conference**.
+
 All commands below should be run from the repository root.
 
 ## 1. Install
