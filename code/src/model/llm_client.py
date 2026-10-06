@@ -10,7 +10,7 @@ import threading
 import openai
 
 
-CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002")
 _thread_clients = threading.local()
 

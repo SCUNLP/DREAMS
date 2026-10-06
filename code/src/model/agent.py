@@ -27,6 +27,7 @@ class CHATGPT(AgentBehaviorMixin):
         repo_root=None,
     ) -> None:
         self.seed = seed
+        self.simulation_workers = max(1, simulation_workers)
         self.debug = debug
         if self.seed is not None:
             random.seed(self.seed)
@@ -103,6 +104,7 @@ class CHATGPT(AgentBehaviorMixin):
             },
             'user_attitude': 'undecided',
             'recommended_items': [],
+            'excluded_items': [],
             'actions_taken': [],
             'turn_count': 0,
             'context': []
@@ -227,7 +229,19 @@ class CHATGPT(AgentBehaviorMixin):
 
             Identify:
             1. Movie preferences (genres, actors, directors)
-            2. User's attitude toward recommendations (whether they accepted, rejected, or are undecided)
+            2. The latest USER message's attitude toward the current recommendation
+            3. Movie titles the user has already seen or rejected (excluded_items)
+
+            Preserve preferences stated earlier unless the user changes them. Only extract
+            preferences expressed by the user; movie mentions or assistant suggestions
+            alone are not positive preferences. Do not infer every genre of a mentioned film.
+            Resolve actor/director clues to their names. The latest clarification overrides
+            earlier assumptions. Judge attitude from the latest user message, not an older
+            reaction or the assistant's enthusiasm. Never infer acceptance before a movie
+            was recommended. Exclude watched/rejected films unless the user reconsiders.
+            List changed_preferences only for categories the latest user explicitly
+            corrects or replaces. Do not mark an unchanged category just because its
+            values were not mentioned again. Adding another preference is not replacement.
 
             Genres should be from the following list: {'action', 'adventure', 'animation', 'biography', 'comedy', 'crime', 'documentary', 'drama',
                     'family', 'fantasy', 'film-noir', 'game-show', 'history', 'horror', 'music', 'musical', 'mystery', 'news', 'reality-tv', 'romance', 'sci-fi', 'short', 'sport', 'talk-show', 'thriller',
@@ -248,7 +262,9 @@ class CHATGPT(AgentBehaviorMixin):
                     "directors": ["director1", "director2", ...]
                 },
                 "attitude": "undecided | accepted | rejected",
-                "attitude_confidence": 0.0-1.0
+                "attitude_confidence": 0.0-1.0,
+                "excluded_items": ["catalogue movie titles, with year when known"],
+                "changed_preferences": ["genres | actors | directors, only when replaced"]
             }
 
             For attitude classification:
@@ -286,23 +302,32 @@ class CHATGPT(AgentBehaviorMixin):
             analysis = json.loads(analysis_json)
 
             preferences = analysis.get('preferences', {})
-            for genre in preferences.get('genres', []):
-                if genre.lower() not in [g.lower() for g in self.conversation_state['user_preferences']['genres']]:
-                    self.conversation_state['user_preferences']['genres'].append(genre.lower())
-
-            for actor in preferences.get('actors', []):
-                if actor.lower() not in [a.lower() for a in self.conversation_state['user_preferences']['actors']]:
-                    self.conversation_state['user_preferences']['actors'].append(actor.lower())
-
-            for director in preferences.get('directors', []):
-                if director.lower() not in [d.lower() for d in self.conversation_state['user_preferences']['directors']]:
-                    self.conversation_state['user_preferences']['directors'].append(director.lower())
+            for category in ('genres', 'actors', 'directors'):
+                values = preferences.get(category)
+                if isinstance(values, list):
+                    previous = self.conversation_state['user_preferences'][category]
+                    if category in analysis.get('changed_preferences', []):
+                        previous = []
+                    self.conversation_state['user_preferences'][category] = list(dict.fromkeys(
+                        previous + [value.strip().lower() for value in values
+                                    if isinstance(value, str) and value.strip()]))
+            excluded = analysis.get('excluded_items')
+            if isinstance(excluded, list):
+                self.conversation_state['excluded_items'] = list(dict.fromkeys(
+                    value.strip() for value in excluded if isinstance(value, str) and value.strip()))
 
             attitude = analysis.get('attitude', 'undecided')
             confidence = analysis.get('attitude_confidence', 0.0)
 
             if confidence > 0.4:  # Only update if confidence is reasonable
                 self.conversation_state['user_attitude'] = attitude
+            if not self.conversation_state['recommended_items']:
+                self.conversation_state['user_attitude'] = 'undecided'
+            elif self.conversation_state['user_attitude'] == 'rejected':
+                name = self.movie_info.get('name')
+                excluded = self.conversation_state.setdefault('excluded_items', [])
+                if name and name not in excluded:
+                    excluded.append(name)
 
             if self.debug:
                 logger.info(f"Extracted analysis: {analysis}")

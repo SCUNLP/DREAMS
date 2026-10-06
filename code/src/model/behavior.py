@@ -3,14 +3,16 @@
 import copy
 import difflib
 import json
-import math
 import random
+import re
+import time
 from collections import Counter
 
 import numpy as np
 from loguru import logger
 from sklearn.metrics.pairwise import cosine_similarity
 
+from .parallel import iter_completed
 from .errors import ActionExecutionError, LLMError, StateError
 from .llm_client import (
     CHAT_MODEL,
@@ -25,6 +27,52 @@ GPT4 = CHAT_MODEL
 
 
 class AgentBehaviorMixin:
+    def _matches_preferences(self, item, preferences):
+        """Check catalogue attributes, independent of an LLM's choice or query wording."""
+        def normalized(values):
+            if isinstance(values, str):
+                values = [values]
+            return {v.strip().casefold() for v in (values or []) if isinstance(v, str)}
+
+        state = self.conversation_state
+        excluded = normalized(state.get('excluded_items', []))
+        excluded.update(normalized(preferences.get('excluded_items', [])))
+        name = item['name'].strip().casefold()
+        base_name = re.sub(r'\s*\(\d{4}\)$', '', name)
+        if name in excluded or base_name in excluded:
+            return False
+        for category, attribute, state_key in (
+            ('genres', 'genre', 'genres'), ('stars', 'star', 'actors'),
+            ('directors', 'director', 'directors'),
+        ):
+            group = preferences.get(category, {})
+            fallback = state.get('user_preferences', {}).get(state_key, [])
+            extracted = group.get('liked', []) if isinstance(group, dict) else group
+            liked = normalized(fallback) or normalized(extracted)
+            disliked = normalized(group.get('disliked', []) if isinstance(group, dict) else [])
+            actual = normalized(item.get(attribute, []))
+            if actual & disliked:
+                return False
+            if liked and (not liked <= actual if category == 'genres' else not liked & actual):
+                return False
+        return True
+
+    def _retrieve_candidates(self, query, preferences):
+        """Filter before truncating so valid catalogue items survive a narrow top five."""
+        if len(self.item_emb_arr) == 0:
+            raise StateError('No item embeddings available')
+        vector = np.asarray(call_embedding(query).data[0].embedding).reshape(1, -1)
+        similarities = cosine_similarity(vector, self.item_emb_arr)[0]
+        eligible = []
+        for index in np.argsort(similarities)[::-1]:
+            item_id = self.id2item_id_arr[index]
+            if self._matches_preferences(self.id2info[item_id], preferences):
+                eligible.append(item_id)
+                if len(eligible) == 50:
+                    break
+        ranks = [[self.id2entityid[item_id] for item_id in eligible]]
+        return ranks, [self.id2info[item_id] for item_id in eligible[:5]]
+
     def execute_action(self, action, conv_dict, simulate=False):
         """Execute the selected action and update state."""
         try:
@@ -45,16 +93,16 @@ class AgentBehaviorMixin:
                 a = {}
                 b = ""
                 c = conv_paraphrase.get('refined_query')
-                a, b = self.reranking(conv_paraphrase)
+                a, b = self.reranking(conv_paraphrase, simulate=simulate)
                 if not simulate:
                     return item_rank_arr, a, b, c
                 else:
                     return a, b
             elif action == "ItemExplanation":
                 if not simulate and not self.movie_info.get("name"):
-                    return self.get_conv(conv_dict)
+                    raise StateError('No recommended movie to explain')
                 elif simulate and not self.movie_info_sim.get("name"):
-                    return self.get_conv(conv_dict)
+                    raise StateError('No simulated recommendation to explain')
                 else:
                     return self.item_explanation(conv_dict, simulate)
             elif action == "FailureReflection":
@@ -133,6 +181,13 @@ class AgentBehaviorMixin:
                     4. Plot elements or themes they enjoy
                     5. Your confidence in information extraction
 
+                    Use the latest user clarification to resolve ambiguous themes.
+                    Preserve unchanged actor/director preferences. Do not turn assistant
+                    suggestions into user preferences. Extract only genres the user wants,
+                    not every genre of a film mentioned as an actor/director clue.
+                    Include every important detail of the latest clarification, such as
+                    the lead's job, the source of danger, and how people are protected.
+
                     Genres should be from the following list: {'action', 'adventure', 'animation', 'biography', 'comedy', 'crime', 'documentary', 'drama',
                     'family', 'fantasy', 'film-noir', 'game-show', 'history', 'horror', 'music', 'musical', 'mystery', 'news', 'reality-tv', 'romance', 'sci-fi', 'short', 'sport', 'talk-show', 'thriller',
                     'war', 'western'}
@@ -199,27 +254,6 @@ class AgentBehaviorMixin:
                     self.children = {}
                     self.visits = 0
                     self.value = 0
-
-                def is_terminal(self):
-                    return self.strategy is not None and len(self.children) == 0
-
-                def expand(self, available_strategies):
-                    for strategy in available_strategies:
-                        if strategy not in self.children:
-                            self.children[strategy] = ParaphraseMCTSNode(strategy=strategy, parent=self)
-                    return list(self.children.values())
-
-                def select_child(self, exploration_weight=1.0):
-                    log_visits = math.log(max(self.visits, 1))
-                    def ucb(child):
-                        if child.visits == 0:
-                            return float('inf')
-                        exploitation = child.value / max(child.visits, 1)
-                        exploration = exploration_weight * math.sqrt(2 * log_visits / max(child.visits, 1))
-                        exploration = min(exploration, 1000.0)
-                        return exploitation + exploration
-
-                    return max(self.children.values(), key=ucb)
 
                 def update(self, reward):
                     self.visits += 1
@@ -304,24 +338,7 @@ class AgentBehaviorMixin:
             # Evaluate a retrieval query using simulated retrieval
             def evaluate_query(query):
                 try:
-                    conv_embed = call_embedding(query).data[0].embedding
-                    conv_embed = np.asarray(conv_embed).reshape(1, -1)
-
-                    if len(self.item_emb_arr) == 0:
-                        raise StateError("No item embeddings available")
-
-                    sim_mat = cosine_similarity(conv_embed, self.item_emb_arr)
-                    rank_arr = np.argsort(sim_mat, axis=-1).tolist()
-                    rank_arr = np.flip(rank_arr, axis=-1)[:, :50]
-                    item_rank_arr = self.id2item_id_arr[rank_arr].tolist()
-                    item_rank_arr = [[self.id2entityid[item_id] for item_id in item_rank_arr[0]]]
-
-                    top_items = []
-                    for i in range(min(5, len(item_rank_arr[0]))):  # Get more items for better evaluation
-                        try:
-                            top_items.append(self.id2info[self.entityid2id[item_rank_arr[0][i]]])
-                        except (KeyError, IndexError):
-                            continue
+                    item_ranks, top_items = self._retrieve_candidates(query, extracted_preferences)
 
                     preference_score = 0
 
@@ -407,91 +424,50 @@ class AgentBehaviorMixin:
 
                     combined_score = (0.3 * preference_score) + (0.7 * potential_attitude_score)
 
-                    return combined_score, top_items
+                    return combined_score, item_ranks, top_items
 
                 except Exception as e:
                     logger.error(f"Error evaluating query: {str(e)}")
-                    return 0, []
+                    return 0, [[]], []
 
-            def paraphrase_mcts(preferences, num_simulations=None):
+            def paraphrase_mcts(preferences):
+                # One visit per independent strategy, as in the original four-rollout budget.
+                # Evaluate concurrently; merge/backpropagate in strategy order for stable ties.
                 root = ParaphraseMCTSNode()
-                num_simulations = num_simulations or len(paraphrase_strategies)
+                results = {}
 
-                for _ in range(num_simulations):
-                    # Selection
-                    node = root
-                    while node.children and not node.is_terminal():
-                        if len(node.children) < len(paraphrase_strategies):
-                            # Not fully expanded
-                            unexplored = [s for s in paraphrase_strategies if s not in node.children]
-                            node.expand([unexplored[0]])
-                            node = node.children[unexplored[0]]
-                            break
-                        else:
-                            node = node.select_child()
+                def evaluate_strategy(strategy):
+                    started = time.monotonic()
+                    query = generate_retrieval_query(strategy, preferences)
+                    reward, ranks, items = evaluate_query(query)
+                    if self.trace:
+                        self.trace.record("retrieval_reward", strategy=strategy,
+                                          reward=reward, query=query,
+                                          seconds=round(time.monotonic()-started, 3))
+                    return query, reward, ranks, items
 
-                    # Expansion
-                    if not node.is_terminal() and node.strategy is None:
-                        children = node.expand(paraphrase_strategies)
-                        if children:
-                            node = random.choice(children)
+                workers = getattr(self, 'simulation_workers', 1)
+                for strategy, result in iter_completed(evaluate_strategy, paraphrase_strategies, workers):
+                    results[strategy] = result
+                for strategy in paraphrase_strategies:
+                    child = ParaphraseMCTSNode(strategy, root)
+                    root.children[strategy] = child
+                    child.update(results[strategy][1])
+                    root.update(results[strategy][1])
+                best = max(root.children.values(), key=lambda n: n.value / n.visits)
+                return best.strategy, results[best.strategy]
 
-                    # Simulation
-                    if node.strategy:
-                        # Generate query using this strategy
-                        query = generate_retrieval_query(node.strategy, preferences)
-                        # Evaluate the query quality
-                        reward, _ = evaluate_query(query)
-                        if self.trace:
-                            self.trace.record(
-                                "retrieval_reward",
-                                strategy=node.strategy,
-                                reward=reward,
-                                query=query,
-                            )
-                    else:
-                        reward = 0
-
-                    # Backpropagation
-                    while node is not None:
-                        node.update(reward)
-                        node = node.parent
-
-                if not root.children:
-                    return "balanced"
-
-                best_child = max(root.children.values(), key=lambda n: n.value / max(n.visits, 1))
-                return best_child.strategy
-
-            best_strategy = paraphrase_mcts(extracted_preferences)
+            best_strategy, result = paraphrase_mcts(extracted_preferences)
+            refined_query, _, item_rank_arr, self.item_to_recommend = result
             if self.trace:
-                self.trace.record("retrieval_strategy_selected", strategy=best_strategy)
-
-            refined_query = generate_retrieval_query(best_strategy, extracted_preferences)
-
-            conv_embed = call_embedding(refined_query).data[0].embedding
-            conv_embed = np.asarray(conv_embed).reshape(1, -1)
-
-            if len(self.item_emb_arr) == 0:
-                raise StateError("No item embeddings available")
-
-            sim_mat = cosine_similarity(conv_embed, self.item_emb_arr)
-            rank_arr = np.argsort(sim_mat, axis=-1).tolist()
-            rank_arr = np.flip(rank_arr, axis=-1)[:, :50]
-            item_rank_arr = self.id2item_id_arr[rank_arr].tolist()
-            item_rank_arr = [[self.id2entityid[item_id] for item_id in item_rank_arr[0]]]
-
-            self.item_to_recommend = []
-            for i in range(min(5, len(item_rank_arr[0]))):
-                try:
-                    self.item_to_recommend.append(self.id2info[self.entityid2id[item_rank_arr[0][i]]])
-                except (KeyError, IndexError):
-                    continue
+                self.trace.record("retrieval_strategy_selected", strategy=best_strategy,
+                                  reused_evaluation=True)
 
             meta_info = {
                 'refined_query': refined_query,
                 'strategy_used': best_strategy,
-                'extracted_preferences': extracted_preferences
+                'extracted_preferences': extracted_preferences,
+                'context': list(context),
             }
 
             logger.info(f"Paraphrase strategy selected: {best_strategy}")
@@ -549,7 +525,7 @@ class AgentBehaviorMixin:
         try:
             if not simulate:
                 if not self.movie_info["name"]:
-                    return self.get_conv(conv_dict)
+                    raise StateError('No recommended movie to explain')
                 explanation_prompt = [
                 {"role": "system", "content": f"""You are a movie expert.
                 Provide an engaging explanation about the movie "{self.movie_info['name']}" according to the dialogue history.
@@ -559,7 +535,7 @@ class AgentBehaviorMixin:
             ]
             else:
                 if not self.movie_info_sim["name"]:
-                    return self.get_conv(conv_dict)
+                    raise StateError('No simulated recommendation to explain')
                 explanation_prompt = [
                 {"role": "system", "content": f"""You are a movie expert.
                 Provide an engaging explanation about the movie "{self.movie_info_sim['name']}".
@@ -662,29 +638,34 @@ class AgentBehaviorMixin:
                 'next_action': next_action,
                 'confidence': analysis.get('confidence', 0.0)
             }
+            if self.trace:
+                self.trace.record('reflection', simulation=simulate, **meta_info)
             if not simulate:
                 self.conversation_state['actions_taken'].append(next_action)
 
             if next_action == "GenreInquiry":
-                return self.genre_inquiry(conv_dict)
+                result = self.genre_inquiry(conv_dict)
             elif next_action == "ActorInquiry":
-                return self.actor_inquiry(conv_dict)
+                result = self.actor_inquiry(conv_dict)
             elif next_action == "DirectorInquiry":
-                return self.director_inquiry(conv_dict)
+                result = self.director_inquiry(conv_dict)
             elif next_action == "ItemExplanation":
-                return self.item_explanation(conv_dict)
+                result = self.item_explanation(conv_dict, simulate)
             elif next_action == "ItemRecommendation":
                 conv_paraphrase, item_rank_arr = self.conv_paraphrase(conv_dict)
                 a = {}
                 b = ""
                 c = conv_paraphrase.get('refined_query')
-                a, b = self.reranking(conv_paraphrase)
+                a, b = self.reranking(conv_paraphrase, simulate=simulate)
+                a['reflection'] = meta_info
                 if not simulate:
                     self.conversation_state['actions_taken'].append("Retrieval")
                     self.conversation_state['actions_taken'].append("Reranking")
                     return item_rank_arr, a, b, c
                 else:
-                    return None, a, b, None
+                    return a, b
+            result[0]['reflection'] = meta_info
+            return result
 
         except Exception as e:
             logger.error(f"Error in failure reflection: {str(e)}")
@@ -908,16 +889,20 @@ Candidate List
             else:
                 user_preference = conv_dict['refined_query']
 
-            if not self.item_to_recommend:
-                raise ActionExecutionError(f"Failed to execute reranking: none item_to_recommend")
+            preferences = conv_dict.get('extracted_preferences', {})
+            candidates = [item for item in self.item_to_recommend
+                          if self._matches_preferences(item, preferences)]
+            if not candidates:
+                raise ActionExecutionError('No catalogue candidates satisfy the current preferences and exclusions')
 
             candidates_info = []
-            for item in self.item_to_recommend:
+            for item in candidates:
                 candidate = {
                     'name': item['name'],
                     'genre': item['genre'],
                     'star': item['star'],
-                    'director': item['director']
+                    'director': item['director'],
+                    'plot': item.get('plot', ''),
                 }
                 candidates_info.append(candidate)
 
@@ -925,7 +910,7 @@ Candidate List
             explanations = {}
             confidences = {}
 
-            for i in range(3):
+            def rerank_vote(vote_id):
                 shuffled_candidates = candidates_info.copy()
                 random.shuffle(shuffled_candidates)
                 shuffled_candidates_with_id = [
@@ -947,6 +932,10 @@ Candidate List
                 The target movie must cater to all genres of movies that the user likes, and at least one star that the user prefers must be involved, as well as at least one director that the user likes must direct.
                 You should only select one movie from the candidate list for one time.
                 Not! Do not repeat recommending movies that you have recommended but the user does not like.
+                Use the supplied plots and latest user clarification to evaluate themes.
+                Actor/director matches alone do not establish a plot match. Do not invent
+                a missing plot element or relax a required preference. Prefer the movie
+                whose actual plot matches how the user wants the lead to protect people.
 
                 Return a JSON object with:
                 1. The selected movie name
@@ -978,7 +967,8 @@ Candidate List
                 rerank_prompt.append({
                     "role": "user",
                     "content": f"""
-                    Here is the extracted user preference:\n{json.dumps(shuffled_pref, indent=2)}
+                    Here is the extracted user preference:\n{json.dumps(preferences, indent=2)}
+                    Here is the retrieval query:\n{json.dumps(shuffled_pref, indent=2)}
                     Here are the candidate movies to analyze:\n{json.dumps(shuffled_candidates_with_id, indent=2)}"""
                 })
 
@@ -995,16 +985,12 @@ Candidate List
                     explanation = analysis.get('explanation', '')
 
                     found = False
-                    for item in self.item_to_recommend:
+                    for item in candidates:
                         if item['name'] == selected_movie:
-                            self.movie_info_sim = {"name": selected_movie}
                             found = True
                             break
                     if found:
-                        vote_counter[selected_movie] += 1
-                        explanations.setdefault(selected_movie, []).append(explanation)
-                        confidences.setdefault(selected_movie, []).append(confidence)
-                        break
+                        return selected_movie, confidence, explanation
                     else:
                         rerank_prompt.append({
                             "role": "system",
@@ -1013,6 +999,15 @@ Candidate List
                 else:
                     raise LLMError("LLM did not select a valid candidate after 3 attempts")
 
+            workers = getattr(self, 'simulation_workers', 1)
+            votes = dict(iter_completed(rerank_vote, list(range(3)), workers))
+            # Completion order must not change majority-vote tie breaking.
+            for vote_id in range(3):
+                selected_movie, confidence, explanation = votes[vote_id]
+                vote_counter[selected_movie] += 1
+                explanations.setdefault(selected_movie, []).append(explanation)
+                confidences.setdefault(selected_movie, []).append(confidence)
+
             if not vote_counter:
                 raise ActionExecutionError("LLM failed to return any valid recommendation.")
 
@@ -1020,7 +1015,7 @@ Candidate List
             avg_conf = sum(confidences[final_movie]) / len(confidences[final_movie])
             example_expl = explanations[final_movie][0]
 
-            self.movie_info_sim = {"name": final_movie}
+            self.movie_info_sim = dict(next(item for item in candidates if item['name'] == final_movie))
             if not simulate:
                 self.movie_info = self.movie_info_sim
 
@@ -1031,7 +1026,7 @@ Candidate List
             meta_info = {
                 'ans_type': 'rec',
                 'rec_item': final_movie,
-                'rec_info': self.movie_info,
+                'rec_info': self.movie_info_sim if simulate else self.movie_info,
                 'confidence': avg_conf,
                 'explanation': example_expl
             }

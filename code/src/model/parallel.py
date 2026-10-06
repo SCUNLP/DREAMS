@@ -9,7 +9,7 @@ def iter_completed(function, jobs, worker_count):
             yield job, function(job)
         return
 
-    with ThreadPoolExecutor(max_workers=min(worker_count, len(jobs))) as executor:
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {executor.submit(function, job): job for job in jobs}
         for future in as_completed(futures):
             yield futures[future], future.result()

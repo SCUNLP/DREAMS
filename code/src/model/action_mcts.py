@@ -174,6 +174,16 @@ class MCTS:
             return action
 
         root = MCTSNode(self.crs_agent, state, trace=self.trace, transition=self._expand_action)
+        positive_actions = [a for a, score in predicted_action_scores.items() if score > 0]
+        if positive_actions == ['ItemExplanation']:
+            # The policy leaves no action choice; generating hypothetical explanations
+            # cannot change the decision. Recommendations/reflections still run search.
+            if self.trace:
+                self.trace.record("forced_action", action='ItemExplanation', rollout=False,
+                                  reason="Only ItemExplanation has a positive policy score")
+                self.trace.record("selected_action", action='ItemExplanation')
+                self.trace.render(root, state)
+            return 'ItemExplanation'
         if self.simulation_workers == 1:
             self._run_sequential(root, predicted_action_scores, state)
         else:
@@ -204,16 +214,19 @@ class MCTS:
     def _run_parallel(self, root, predicted_action_scores, state):
         # Batched MCTS: selection/expansion stays serial; independent rollout
         # simulations run concurrently and are merged through serial backprop.
-        selected_nodes = []
-        for simulation_id in range(self.simulation_count):
-            node = self.select(root, predicted_action_scores)
-            self._apply_virtual_loss(node)
-            selected_nodes.append((simulation_id, node))
-            if self.trace:
-                self.trace.record("tree_expanded", simulation=simulation_id, action=node.action)
-                self.trace.render(root, state)
+        def selected_nodes():
+            # Submit each completed expansion immediately; its isolated rollout can
+            # run while the main thread expands the next node. Merge only after
+            # all selections, retaining the existing batched virtual-loss semantics.
+            for simulation_id in range(self.simulation_count):
+                node = self.select(root, predicted_action_scores)
+                self._apply_virtual_loss(node)
+                if self.trace:
+                    self.trace.record("tree_expanded", simulation=simulation_id, action=node.action)
+                    self.trace.render(root, state)
+                yield simulation_id, node
 
-        worker_count = min(self.simulation_workers, len(selected_nodes))
+        worker_count = min(self.simulation_workers, self.simulation_count)
 
         def rollout(job):
             simulation_id, node = job
@@ -222,7 +235,7 @@ class MCTS:
             except Exception as error:
                 return error
 
-        for (simulation_id, node), reward in iter_completed(rollout, selected_nodes, worker_count):
+        for (simulation_id, node), reward in iter_completed(rollout, selected_nodes(), worker_count):
             self._remove_virtual_loss(node)
             if isinstance(reward, Exception):
                 if self.trace:
@@ -299,20 +312,30 @@ class MCTS:
             action_scores = json.loads(action_scores_json)
             reason = action_scores.pop('reason', None)
 
-            total_score = sum(action_scores.values())
-            if total_score > 0:
-                for action in action_scores:
-                    action_scores[action] = action_scores[action] / total_score
-
-
-            return action_scores, reason
-
         except Exception as e:
             logger.error(f"Error getting LLM action policy: {e}")
             actions = [
                 "GenreInquiry", "ActorInquiry", "DirectorInquiry", "ItemRecommendation", "ItemExplanation", "FailureReflection"
             ]
-            return {action: 1/len(actions) for action in actions}, "uniform fallback after policy error"
+            action_scores = {action: 1 for action in actions}
+            reason = "uniform fallback after policy error"
+
+        # Enforce action preconditions before tree expansion and rollout noise.
+        allowed = {'GenreInquiry', 'ActorInquiry', 'DirectorInquiry', 'ItemRecommendation'}
+        if state.get('recommended_items'):
+            if state.get('user_attitude') == 'rejected':
+                allowed = {'FailureReflection'}
+            else:
+                allowed.add('ItemExplanation')
+        scores = {action: max(0, float(score)) if action in allowed and isinstance(score, (int, float)) else 0
+                  for action, score in action_scores.items()}
+        for action in allowed:
+            scores.setdefault(action, 0)
+        total = sum(scores.values())
+        if not total:
+            scores = {action: 1 if action in allowed else 0 for action in scores}
+            total = len(allowed)
+        return {action: score / total for action, score in scores.items()}, reason
 
     def format_state_for_llm(self, state):
         """Format the state into a readable description for the LLM."""
@@ -342,6 +365,7 @@ class MCTS:
                 description += f"- {item}\n"
         else:
             description += "- No recommendations made yet\n"
+        description += f"\nExcluded movies: {state.get('excluded_items', [])}\n"
 
         # User attitude
         description += f"\nUser attitude: {state.get('user_attitude', 'undecided')}\n"
@@ -359,8 +383,8 @@ class MCTS:
             description += "- No actions taken yet\n"
 
         description += "\nRecent conversation:\n"
-        recent_context = state['context'][-4:] if len(state['context']) >= 4 else state['context']
-        for i, message in enumerate(recent_context):
+        start = max(0, len(state['context']) - 4)
+        for i, message in enumerate(state['context'][start:], start=start):
             role = "User" if i % 2 == 0 else "Assistant"
             description += f"{role}: {message}\n"
 
@@ -373,7 +397,8 @@ class MCTS:
             iterations = 0
             while not node.is_terminal() and iterations < max_iterations:
                 if not node.is_fully_expanded():
-                    expanded_node = node.expand(predicted_action_scores)
+                    scores = predicted_action_scores if node.parent is None else self.get_llm_action_policy(node.state)[0]
+                    expanded_node = node.expand(scores)
                     if expanded_node is None:
                         # If expansion failed, try to select a child if available
                         if node.children:
@@ -429,7 +454,7 @@ class MCTS:
                         logger.warning("No action scores returned from LLM")
                         break
 
-                    actions = list(action_scores.keys())
+                    actions = [action for action, score in action_scores.items() if score > 0]
                     scores = np.array([action_scores[a] for a in actions])
 
 
@@ -570,6 +595,10 @@ class MCTS:
 
         new_state['actions_taken'].append(action)
         new_state['turn_count'] = new_state.get('turn_count', 0) + 0.5  # Increment by 0.5 since a full turn is user+assistant
+        simulation_agent.conversation_state = new_state
+        recommended = new_state.get('recommended_items', [])
+        if recommended and simulation_agent.movie_info_sim.get('name') != recommended[-1]:
+            simulation_agent.movie_info_sim = {'name': recommended[-1]}
 
         try:
             conv_dict = {
@@ -588,6 +617,11 @@ class MCTS:
             user_feedback = self._simulate_user_feedback(action, new_state, meta_info)
             new_state['context'].append(user_feedback)
             self._update_state_from_feedback(new_state, user_feedback)
+            if new_state.get('user_attitude') == 'rejected':
+                name = meta_info.get('rec_item') or simulation_agent.movie_info_sim.get('name')
+                excluded = new_state.setdefault('excluded_items', [])
+                if name and name not in excluded:
+                    excluded.append(name)
             if self.trace:
                 self.trace.record(
                     "feedback",

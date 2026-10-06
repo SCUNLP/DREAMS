@@ -13,9 +13,9 @@
       --danger: #ff8f8f;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 15% -10%, #182840 0, transparent 34%), var(--bg); color: var(--text); }
+    body { margin: 0; height: 100vh; height: 100dvh; overflow: hidden; background: radial-gradient(circle at 15% -10%, #182840 0, transparent 34%), var(--bg); color: var(--text); }
     button, textarea { font: inherit; }
-    .shell { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+    .shell { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); }
     header { height: 70px; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); background: rgba(8,11,18,.82); backdrop-filter: blur(16px); }
     .brand { display: flex; align-items: center; gap: 12px; }
     .mark { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #06111a; font-weight: 900; }
@@ -26,7 +26,7 @@
     .dot.ready { background: var(--accent); }
     main { min-height: 0; display: grid; grid-template-columns: minmax(420px, 1.35fr) minmax(360px, .9fr); gap: 1px; background: var(--line); }
     .chat, .inspector { min-height: 0; background: var(--bg); }
-    .chat { display: grid; grid-template-rows: 1fr auto; }
+    .chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
     .messages { min-height: 0; overflow: auto; padding: 28px max(24px, 6vw); }
     .empty-chat { max-width: 580px; margin: 15vh auto 0; text-align: center; }
     .empty-chat h2 { margin: 0 0 12px; font-size: clamp(26px, 4vw, 42px); letter-spacing: -.04em; }
@@ -69,8 +69,7 @@
     .placeholder { margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.6; }
     .error { color: var(--danger); }
     @media (max-width: 900px) {
-      main { grid-template-columns: 1fr; grid-template-rows: minmax(68vh, 1fr) auto; }
-      .inspector { max-height: 55vh; }
+      main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, .55fr); }
       header { padding: 0 14px; } .subtitle { display: none; }
       .messages, .composer-wrap { padding-left: 16px; padding-right: 16px; }
     }
@@ -79,13 +78,13 @@
 <body>
 <div class="shell">
   <header>
-    <div class="brand"><div class="mark">D</div><div><h1>DREAMS</h1><div class="subtitle">Dual MCTS Conversational Recommender</div></div></div>
+    <div class="brand"><div class="mark">D</div><div><h1>DREAMS</h1><div class="subtitle">Dual-node MCTS Conversational Recommender</div></div></div>
     <div style="display:flex;align-items:center;gap:14px"><div class="status"><span id="status-dot" class="dot"></span><span id="status">正在初始化</span></div><button id="new-chat" class="new-chat" type="button">新对话</button></div>
   </header>
   <main>
     <section class="chat" aria-label="CRS 对话">
       <div id="messages" class="messages" aria-live="polite">
-        <div id="empty" class="empty-chat"><h2>想看什么电影？</h2><p>描述你喜欢的类型、演员、导演或最近看过的电影。DREAMS 会先了解偏好，再通过双层 MCTS 搜索给出推荐。</p></div>
+        <div id="empty" class="empty-chat"><h2>想看什么电影？</h2><p>描述你喜欢的类型、演员、导演或最近看过的电影。DREAMS 会先了解偏好，再通过 dual-node MCTS 搜索给出推荐。</p></div>
       </div>
       <div class="composer-wrap">
         <form id="composer" class="composer">
@@ -192,7 +191,7 @@
         ui.messages.replaceChildren();
         const empty = document.createElement('div'); empty.id = 'empty'; empty.className = 'empty-chat';
         const title = document.createElement('h2'); title.textContent = '想看什么电影？';
-        const text = document.createElement('p'); text.textContent = '描述你喜欢的类型、演员、导演或最近看过的电影。DREAMS 会先了解偏好，再通过双层 MCTS 搜索给出推荐。';
+        const text = document.createElement('p'); text.textContent = '描述你喜欢的类型、演员、导演或最近看过的电影。DREAMS 会先了解偏好，再通过 dual-node MCTS 搜索给出推荐。';
         empty.append(title, text); ui.messages.append(empty); ui.empty = empty;
       }
       renderTrace(data.trace); setStatus('已连接', true); setBusy(false); ui.input.focus();
